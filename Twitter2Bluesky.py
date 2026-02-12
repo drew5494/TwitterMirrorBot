@@ -47,6 +47,13 @@ async def get_metadata(session, url):
         print(f"Metadata extraction warning for {url}: {e}")
         return None
 
+def fix_utm_source(url):
+    """If utm_source=twitter, change it to utm_source=bluesky"""
+    if not url:
+        return url
+    # Replace only if utm_source=twitter exists
+    return re.sub(r'(utm_source=)twitter', r'\1bluesky', url)
+
 async def fetch_image_to_memory(session, url):
     """Download image to RAM without size limit."""
     try:
@@ -104,6 +111,7 @@ async def monitor_tweets(session, account):
 
             # Extract URL
             full_url = latest_tweet.urls[0].get('expanded_url') if latest_tweet.urls else None
+            full_url = fix_utm_source(full_url)
             embed = None
 
             if full_url:
