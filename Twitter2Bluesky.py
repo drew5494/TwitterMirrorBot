@@ -134,6 +134,13 @@ async def monitor_tweets(session, account):
                 del metadata
 
             clean_text = SHORT_URL_PATTERN.sub('', latest_tweet.text).strip()
+            
+            # --- Bluesky character limit check ---
+            BLUESKY_LIMIT = 300
+            if len(clean_text) > BLUESKY_LIMIT:
+                print(f"[{twitter_user}] Tweet too long for Bluesky ({len(clean_text)} chars). Trimming.")
+                clean_text = clean_text[:BLUESKY_LIMIT - 3].rstrip() + "..."
+            
             tb = TextBuilder()
             tb.text(clean_text)
 
