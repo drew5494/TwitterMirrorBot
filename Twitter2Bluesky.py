@@ -24,6 +24,9 @@ ACCOUNTS = [
     }
 ]
 
+MAX_CHARS = 300
+ELLIPSIS = "…"
+
 # Pre-compile regex
 SHORT_URL_PATTERN = re.compile(r'https://t.co/[a-zA-Z0-9]+')
 
@@ -46,6 +49,23 @@ async def get_metadata(session, url):
     except Exception as e:
         print(f"Metadata extraction warning for {url}: {e}")
         return None
+
+
+def truncate_at_word_boundary(text, max_chars=300):
+    if len(text) <= max_chars:
+        return text
+
+    cutoff = max_chars - len(ELLIPSIS)
+    truncated = text[:cutoff]
+
+    # Find the last space within the cutoff
+    last_space = truncated.rfind(" ")
+
+    if last_space == -1:
+        # No spaces found (single long word), hard cut
+        return truncated + ELLIPSIS
+
+    return truncated[:last_space].rstrip() + ELLIPSIS
 
 def fix_utm_source(url):
     """If utm_source=twitter, change it to utm_source=bluesky"""
@@ -134,6 +154,8 @@ async def monitor_tweets(session, account):
                 del metadata
 
             clean_text = SHORT_URL_PATTERN.sub('', latest_tweet.text).strip()
+            clean_text = truncate_at_word_boundary(clean_text, MAX_CHARS)
+         
             tb = TextBuilder()
             tb.text(clean_text)
 
