@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import io
+import random
 import aiohttp
 from lxml import html
 from twikit import Client
@@ -10,7 +11,6 @@ from atproto import Client as BlueskyClient
 from atproto import models
 
 # --- CONFIGURATION ---
-# Define multiple accounts here
 ACCOUNTS = [
     {
         'twitter_user': os.getenv('TWITTER_USER1', ''),
@@ -26,110 +26,113 @@ ACCOUNTS = [
 
 MAX_CHARS = 300
 ELLIPSIS = "…"
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
 
 # Pre-compile regex
 SHORT_URL_PATTERN = re.compile(r'https://t.co/[a-zA-Z0-9]+')
 
-# --- METADATA / IMAGE FUNCTIONS ---
+# --- HELPER FUNCTIONS ---
+
 async def get_metadata(session, url):
-    """Extract OpenGraph metadata using lxml (first 10KB for efficiency)."""
+    """Extract OpenGraph metadata. Increased chunk size to 64KB for news sites."""
     try:
-        async with session.get(url, timeout=10) as response:
+        async with session.get(url, timeout=10, headers=HEADERS) as response:
             if response.status != 200:
                 return None
-            html_chunk = await response.content.read(1024 * 10)  # 10 KB only
+            
+            # News sites often have large <head> sections; 64KB is safer than 10KB
+            html_chunk = await response.content.read(64 * 1024)
             tree = html.fromstring(html_chunk)
-            title = tree.findtext('.//title') or 'No title'
+            
+            title = (tree.xpath('//meta[@property="og:title"]/@content') or 
+                     [tree.findtext('.//title') or 'No title'])[0]
+            
             description = (tree.xpath('//meta[@property="og:description"]/@content') or
                            tree.xpath('//meta[@name="description"]/@content') or
                            ['No description'])[0]
+            
             thumbnail = (tree.xpath('//meta[@property="og:image"]/@content') or [None])[0]
-            del tree
-            return {'title': title, 'description': description, 'thumbnail': thumbnail}
+            
+            return {'title': title.strip(), 'description': description.strip(), 'thumbnail': thumbnail}
     except Exception as e:
-        print(f"Metadata extraction warning for {url}: {e}")
+        print(f"Metadata warning for {url}: {e}")
         return None
-
 
 def truncate_at_word_boundary(text, max_chars=300):
     if len(text) <= max_chars:
         return text
-
     cutoff = max_chars - len(ELLIPSIS)
     truncated = text[:cutoff]
-
-    # Find the last space within the cutoff
     last_space = truncated.rfind(" ")
-
     if last_space == -1:
-        # No spaces found (single long word), hard cut
         return truncated + ELLIPSIS
-
     return truncated[:last_space].rstrip() + ELLIPSIS
 
 def fix_utm_source(url):
-    """If utm_source=twitter, change it to utm_source=bluesky"""
-    if not url:
-        return url
-    # Replace only if utm_source=twitter exists
+    if not url: return url
     return re.sub(r'(utm_source=)twitter', r'\1bluesky', url)
 
 async def fetch_image_to_memory(session, url):
-    """Download image to RAM without size limit."""
     try:
         async with session.get(url, timeout=15) as response:
             if response.status == 200:
-                data = await response.read()
-                return io.BytesIO(data)
+                return io.BytesIO(await response.read())
     except Exception as e:
-        print(f"Image download warning for {url}: {e}")
+        print(f"Image download warning: {e}")
     return None
 
 # --- MONITOR FUNCTION ---
-async def monitor_tweets(session, account):
-    twitter_user = account['twitter_user']
-    bluesky_user = account['bluesky_user']
-    bluesky_pass = account['bluesky_pass']
 
-    # Initialize clients per account
-    client = Client('en-US')
-    bluesky_client = BlueskyClient()
+async def monitor_tweets(session, account):
+    t_user = account['twitter_user']
+    b_user = account['bluesky_user']
+    b_pass = account['bluesky_pass']
+
+    twitter_client = Client('en-US')
+    bsky_client = BlueskyClient()
     previous_tweet_id = None
 
-    # Login
     try:
         if os.path.exists('output_file.json'):
-            client.load_cookies('output_file.json')
-            print(f"[{twitter_user}] Logged into Twitter (Cookies).")
-        bluesky_client.login(bluesky_user, bluesky_pass)
-        print(f"[{twitter_user}] Logged into Bluesky.")
+            twitter_client.load_cookies('output_file.json')
+        
+        bsky_client.login(b_user, b_pass)
+        print(f"[{t_user}] Logged into both platforms.")
+        
+        # Get Twitter User ID
+        user_info = await twitter_client.get_user_by_screen_name(t_user)
+        if not user_info:
+            print(f"[{t_user}] Error: User not found.")
+            return
     except Exception as e:
-        print(f"[{twitter_user}] Login failed: {e}")
+        print(f"[{t_user}] Auth Error: {e}")
         return
 
-    user = await client.get_user_by_screen_name(twitter_user)
-    if not user:
-        print(f"[{twitter_user}] Twitter user not found.")
-        return
-    print(f"[{twitter_user}] Monitoring ID: {user.id}")
-
-    # Start monitoring loop
     while True:
         try:
-            tweets = await client.get_user_tweets(user.id, 'Tweets', count=1)
+            tweets = await twitter_client.get_user_tweets(user_info.id, 'Tweets', count=1)
             if not tweets:
                 await asyncio.sleep(60)
                 continue
 
             latest_tweet = tweets[0]
 
-            if previous_tweet_id == latest_tweet.id:
+            # 1. Initial run: Store ID but don't post to avoid "historical flood"
+            if previous_tweet_id is None:
+                previous_tweet_id = latest_tweet.id
+                print(f"[{t_user}] Initialization successful. Monitoring for new posts...")
                 await asyncio.sleep(60)
                 continue
 
-            print(f"[{twitter_user}] New Tweet: {latest_tweet.text[:50]}...")
+            # 2. Skip if it's the same tweet
+            if previous_tweet_id == latest_tweet.id:
+                # Jitter: sleep between 50-70 seconds so requests aren't perfectly rhythmic
+                await asyncio.sleep(random.uniform(50, 70))
+                continue
 
-            # Extract URL
+            print(f"[{t_user}] New Tweet detected: {latest_tweet.id}")
+
+            # Extract and Clean Metadata
             full_url = latest_tweet.urls[0].get('expanded_url') if latest_tweet.urls else None
             full_url = fix_utm_source(full_url)
             embed = None
@@ -139,7 +142,7 @@ async def monitor_tweets(session, account):
                 if metadata and metadata['thumbnail']:
                     img_buffer = await fetch_image_to_memory(session, metadata['thumbnail'])
                     if img_buffer:
-                        thumb_blob = bluesky_client.upload_blob(img_buffer.getvalue())
+                        thumb_blob = bsky_client.upload_blob(img_buffer.getvalue())
                         embed = models.AppBskyEmbedExternal.Main(
                             external=models.AppBskyEmbedExternal.External(
                                 title=metadata['title'],
@@ -148,37 +151,36 @@ async def monitor_tweets(session, account):
                                 thumb=thumb_blob.blob,
                             )
                         )
-                        img_buffer.close()
-                        del img_buffer
-                        del thumb_blob
-                del metadata
-
+            
+            # Post Content
             clean_text = SHORT_URL_PATTERN.sub('', latest_tweet.text).strip()
             clean_text = truncate_at_word_boundary(clean_text, MAX_CHARS)
-         
+            
             tb = TextBuilder()
             tb.text(clean_text)
 
             try:
-                bluesky_client.send_post(tb, embed=embed)
-                print(f"[{twitter_user}] Posted to Bluesky successfully.")
+                bsky_client.send_post(tb, embed=embed)
+                print(f"[{t_user}] Mirrored to Bluesky.")
                 previous_tweet_id = latest_tweet.id
             except Exception as e:
-                print(f"[{twitter_user}] Bluesky post error: {e}")
+                print(f"[{t_user}] Bluesky post error: {e}")
 
         except Exception as e:
-            print(f"[{twitter_user}] Critical Loop Error: {e}")
+            print(f"[{t_user}] Loop Error: {e}")
+            await asyncio.sleep(120) # Back off on error
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(random.uniform(55, 65))
 
 # --- MAIN ---
+
 async def main():
     async with aiohttp.ClientSession() as session:
-        tasks = [monitor_tweets(session, account) for account in ACCOUNTS]
+        tasks = [monitor_tweets(session, acc) for acc in ACCOUNTS]
         await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopping bot...")
+        print("\nStopping bot safely...")
